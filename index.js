@@ -112,6 +112,9 @@ const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp
 .unblock <number> – unblock a contact
 .delete – reply to a message to delete it for everyone (within ~48h)
 .savestat <number> – re-send a contact's most recent status the bot has seen
+.clear – clear this chat locally + wipe bot caches (confirm with .clear yes)
+.clearcache – flush cached messages/statuses only, without touching the chat
+.massdelete – delete this chat's cached messages for everyone, 48h window (confirm with .massdelete yes)
 .help – show this message`;
 
 function getText(msg) {
@@ -562,6 +565,67 @@ async function handleCommand(sock, msg, ctx) {
       await reply(`This chat's JID: ${jid}`);
       break;
     }
+        case 'clear': {
+      if ((args[0] || '').toLowerCase() !== 'yes') {
+        await reply('⚠️ This clears this chat locally and wipes all bot caches. Send `.clear yes` to confirm.');
+        break;
+      }
+      const cachedMsgs = messageStore.size;
+      const cachedStatuses = recentStatuses.size;
+      try {
+        await sock.chatModify({ delete: true }, jid); // like WhatsApp's "Clear chat", local only
+        messageStore.clear();
+        recentStatuses.clear();
+        console.log(`🧹 Cleared chat ${jid}; flushed ${cachedMsgs} cached messages + ${cachedStatuses} statuses.`);
+      } catch (err) {
+        await reply(`Could not clear the chat. (${err.message})`);
+      }
+      break;
+    }
+
+    case 'clearcache': {
+      const cachedMsgs = messageStore.size;
+      const cachedStatuses = recentStatuses.size;
+      messageStore.clear();
+      recentStatuses.clear();
+      await reply(`🧹 Flushed ${cachedMsgs} cached messages and ${cachedStatuses} statuses.`);
+      break;
+    }
+
+    case 'massdelete': {
+      if ((args[0] || '').toLowerCase() !== 'yes') {
+        await reply('⚠️ Deletes this chat\'s cached messages *for everyone* (48h window). Send `.massdelete yes` to confirm.');
+        break;
+      }
+      const now = Date.now();
+      const WINDOW_MS = 48 * 60 * 60 * 1000;
+      let deleted = 0, failed = 0, expired = 0, otherChat = 0;
+
+      for (const [id, { msg }] of [...messageStore.entries()]) {
+        if (msg.key.remoteJid !== jid) { otherChat++; continue; }
+        const ts = msg.messageTimestamp;
+        const seconds = typeof ts === 'number' ? ts : (ts?.low ?? 0);
+        if (now - seconds * 1000 > WINDOW_MS) { expired++; continue; }
+        try {
+          await sock.sendMessage(jid, {
+            delete: {
+              remoteJid: jid,
+              id,
+              fromMe: !!msg.key.fromMe,
+              participant: jid.endsWith('@g.us') ? msg.key.participant || undefined : undefined,
+            },
+          });
+          messageStore.delete(id);
+          deleted++;
+          await new Promise((r) => setTimeout(r, 250)); // gentle pacing, avoid spam flags
+        } catch {
+          failed++;
+        }
+      }
+      await reply(`🗑️ Done: ${deleted} deleted for everyone, ${failed} failed, ${expired} expired (>48h), ${otherChat} in other chats (untouched).`);
+      break;
+    }
+
 
 
 
