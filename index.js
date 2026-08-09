@@ -25,7 +25,6 @@ const logger = P({ level: 'silent' });
    for reliable delivery. Leave null to try your self-chat. */
 const RESTORE_CHAT = '120363413420187496@g.us';
 
-
 /* ================= statusStore ================= */
 const recentStatuses = new Map(); // senderJid -> { msg, timestamp }
 const MAX_AGE_MS = 24 * 60 * 60 * 1000; // statuses vanish from WhatsApp itself after 24h
@@ -52,6 +51,25 @@ function prune() {
   for (const [key, { timestamp }] of recentStatuses) {
     if (timestamp < cutoff) recentStatuses.delete(key);
   }
+}
+
+/* ================= AFK ================= */
+let afk = null; // { reason, since, missed }
+const afkReplyAt = new Map(); // chatJid -> last auto-reply timestamp (throttle)
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+function isOwnerJid(jid, sock) {
+  if (!jid || !sock.user?.id) return false;
+  const base = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
+  return jid === base || `${jid.split(':')[0]}@s.whatsapp.net` === base;
 }
 
 /* ================= message cache (anti-delete + .vo) ================= */
@@ -82,7 +100,6 @@ async function downloadContent(message, type) {
 
 /* ================= restart ================= */
 
-
 async function checkFfmpeg() {
   try {
     await execFileAsync('ffmpeg', ['-version']);
@@ -101,20 +118,16 @@ const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp
 .pic – reply to a sticker to convert it back to an image/video
 .vo – reply to a view-once image/video/voice note to save it as normal
 .pp – reply to an image to set it as your profile picture
-.save <number> <name> – or reply to someone's message with ".save <name>"
 .kick / .promote / .demote – reply to a member's message (bot must be group admin)
 .lock / .unlock – restrict / allow everyone to talk in the group
 .setname <name> – change group name
 .setdesc <desc> – change group description
 .seticon – reply to an image to change the group icon
 .tagall [message] – mention all group members
-.block – reply to a message, or ".block <number>"
-.unblock <number> – unblock a contact
 .delete – reply to a message to delete it for everyone (within ~48h)
 .savestat <number> – re-send a contact's most recent status the bot has seen
-.clear – clear this chat locally + wipe bot caches (confirm with .clear yes)
-.clearcache – flush cached messages/statuses only, without touching the chat
-.massdelete – delete this chat's cached messages for everyone, 48h window (confirm with .massdelete yes)
+.afk [reason] – mark yourself as away; messages/@mentions get an auto-reply
+.jid – show this chat's ID
 .help – show this message`;
 
 function getText(msg) {
@@ -293,7 +306,6 @@ async function handleRevoke(sock, msg) {
   }
 }
 
-
 async function handleCommand(sock, msg, ctx) {
   if (!msg.key.fromMe) return; // owner-only — this bot automates your own account, on purpose
 
@@ -309,6 +321,17 @@ async function handleCommand(sock, msg, ctx) {
   switch (cmd) {
     case 'help': {
       await reply(HELP_TEXT);
+      break;
+    }
+
+    case 'afk': {
+      const reason = args.join(' ') || 'AFK';
+      afk = { reason, since: Date.now(), missed: 0 };
+      afkReplyAt.clear();
+      await reply(
+        `📴 You're now AFK: ${reason}\n` +
+        `I'll auto-reply to anyone who messages or @mentions you. Send any message to come back.`
+      );
       break;
     }
 
@@ -379,24 +402,6 @@ async function handleCommand(sock, msg, ctx) {
       const resized = await sharp(buffer).resize(640, 640, { fit: 'cover' }).jpeg().toBuffer();
       await sock.updateProfilePicture(sock.user.id, resized);
       await reply('Profile picture updated.');
-      break;
-    }
-
-    case 'save': {
-      let number, name;
-      if (quoted?.participant) {
-        number = quoted.participant.split('@')[0];
-        name = args.join(' ') || number;
-      } else {
-        number = (args[0] || '').replace(/\D/g, '');
-        name = args.slice(1).join(' ') || number;
-      }
-      if (!number) {
-        await reply('Usage: .save <number> <name> — or reply to their message with ".save <name>"');
-        break;
-      }
-      const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nTEL;type=CELL;type=VOICE;waid=${number}:+${number}\nEND:VCARD`;
-      await sock.sendMessage(jid, { contacts: { displayName: name, contacts: [{ vcard }] } });
       break;
     }
 
@@ -508,19 +513,6 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    case 'block':
-    case 'unblock': {
-      let target = quoted?.participant;
-      if (!target && args[0]) target = args[0].replace(/\D/g, '') + '@s.whatsapp.net';
-      if (!target) {
-        await reply(`Reply to a message, or send ".${cmd} <number>"`);
-        break;
-      }
-      await sock.updateBlockStatus(target, cmd);
-      await reply(`${cmd === 'block' ? 'Blocked' : 'Unblocked'} ${target.split('@')[0]}.`);
-      break;
-    }
-
     case 'delete': {
       if (!quoted) {
         await reply('Reply to a message with .delete to remove it for everyone (within ~48h of sending).');
@@ -561,73 +553,11 @@ async function handleCommand(sock, msg, ctx) {
       else await sock.sendMessage(jid, { image: buffer });
       break;
     }
-        case 'jid': {
+
+    case 'jid': {
       await reply(`This chat's JID: ${jid}`);
       break;
     }
-        case 'clear': {
-      if ((args[0] || '').toLowerCase() !== 'yes') {
-        await reply('⚠️ This clears this chat locally and wipes all bot caches. Send `.clear yes` to confirm.');
-        break;
-      }
-      const cachedMsgs = messageStore.size;
-      const cachedStatuses = recentStatuses.size;
-      try {
-        await sock.chatModify({ delete: true }, jid); // like WhatsApp's "Clear chat", local only
-        messageStore.clear();
-        recentStatuses.clear();
-        console.log(`🧹 Cleared chat ${jid}; flushed ${cachedMsgs} cached messages + ${cachedStatuses} statuses.`);
-      } catch (err) {
-        await reply(`Could not clear the chat. (${err.message})`);
-      }
-      break;
-    }
-
-    case 'clearcache': {
-      const cachedMsgs = messageStore.size;
-      const cachedStatuses = recentStatuses.size;
-      messageStore.clear();
-      recentStatuses.clear();
-      await reply(`🧹 Flushed ${cachedMsgs} cached messages and ${cachedStatuses} statuses.`);
-      break;
-    }
-
-    case 'massdelete': {
-      if ((args[0] || '').toLowerCase() !== 'yes') {
-        await reply('⚠️ Deletes this chat\'s cached messages *for everyone* (48h window). Send `.massdelete yes` to confirm.');
-        break;
-      }
-      const now = Date.now();
-      const WINDOW_MS = 48 * 60 * 60 * 1000;
-      let deleted = 0, failed = 0, expired = 0, otherChat = 0;
-
-      for (const [id, { msg }] of [...messageStore.entries()]) {
-        if (msg.key.remoteJid !== jid) { otherChat++; continue; }
-        const ts = msg.messageTimestamp;
-        const seconds = typeof ts === 'number' ? ts : (ts?.low ?? 0);
-        if (now - seconds * 1000 > WINDOW_MS) { expired++; continue; }
-        try {
-          await sock.sendMessage(jid, {
-            delete: {
-              remoteJid: jid,
-              id,
-              fromMe: !!msg.key.fromMe,
-              participant: jid.endsWith('@g.us') ? msg.key.participant || undefined : undefined,
-            },
-          });
-          messageStore.delete(id);
-          deleted++;
-          await new Promise((r) => setTimeout(r, 250)); // gentle pacing, avoid spam flags
-        } catch {
-          failed++;
-        }
-      }
-      await reply(`🗑️ Done: ${deleted} deleted for everyone, ${failed} failed, ${expired} expired (>48h), ${otherChat} in other chats (untouched).`);
-      break;
-    }
-
-
-
 
     default:
       break;
@@ -690,6 +620,49 @@ async function startBot() {
       if (msg.message.protocolMessage) {
         await handleRevoke(sock, msg).catch((err) => console.error('Revoke error:', err.message));
         continue;
+      }
+
+      // AFK: auto-reply to DMs/mentions while the owner is away,
+      // and auto-return when the owner sends any message.
+      if (afk) {
+        const t = getText(msg);
+        const isAfkCmd = msg.key.fromMe && t.startsWith('.') &&
+          t.slice(1).trim().split(/\s+/)[0].toLowerCase() === 'afk';
+
+        if (msg.key.fromMe && !isAfkCmd) {
+          // Owner is back
+          const { missed } = afk;
+          afk = null;
+          afkReplyAt.clear();
+          try {
+            await sock.sendMessage(msg.key.remoteJid, {
+              text: missed > 0
+                ? `👋 Welcome back! You were away — ${missed} message(s) pinged you.`
+                : `👋 Welcome back! You're no longer AFK.`,
+            });
+          } catch (err) {
+            console.error('AFK return message failed:', err.message);
+          }
+        } else if (!msg.key.fromMe) {
+          const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+          const isGroup = msg.key.remoteJid.endsWith('@g.us');
+          const pinged = mentioned.some((j) => isOwnerJid(j, sock));
+          if (!isGroup || pinged) {
+            afk.missed++;
+            const last = afkReplyAt.get(msg.key.remoteJid) || 0;
+            if (Date.now() - last > 60000) { // throttle: max one auto-reply per chat per minute
+              afkReplyAt.set(msg.key.remoteJid, Date.now());
+              try {
+                await sock.sendMessage(msg.key.remoteJid, {
+                  text:
+                    `Rift is currently unavailable*\n`,
+                });
+              } catch (err) {
+                console.error('AFK auto-reply failed:', err.message);
+              }
+            }
+          }
+        }
       }
 
       // Cache every incoming message so .vo and anti-delete can recover it.
