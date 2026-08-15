@@ -118,6 +118,7 @@ const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp
 .pic – reply to a sticker to convert it back to an image/video
 .vo – reply to a view-once image/video/voice note to save it as normal
 .pp – reply to an image to set it as your profile picture
+.getpp – reply to a message (or ".getpp <number>") to fetch their profile picture
 .kick / .promote / .demote – reply to a member's message (bot must be group admin)
 .lock / .unlock – restrict / allow everyone to talk in the group
 .setname <name> – change group name
@@ -402,6 +403,31 @@ async function handleCommand(sock, msg, ctx) {
       const resized = await sharp(buffer).resize(640, 640, { fit: 'cover' }).jpeg().toBuffer();
       await sock.updateProfilePicture(sock.user.id, resized);
       await reply('Profile picture updated.');
+      break;
+    }
+
+    case 'getpp': { // fetch someone's profile picture
+      let target = quoted?.participant;
+      if (!target && args[0]) target = args[0].replace(/\D/g, '') + '@s.whatsapp.net';
+      if (!target) {
+        await reply('Reply to their message, or send ".getpp <number>" to fetch a profile picture.');
+        break;
+      }
+      try {
+        const url = await sock.profilePictureUrl(target, 'image');
+        if (!url) {
+          await reply('No profile picture found for that contact.');
+          break;
+        }
+        const res = await fetch(url);
+        const buffer = Buffer.from(await res.arrayBuffer());
+        await sock.sendMessage(jid, {
+          image: buffer,
+          caption: `🖼️ Profile picture of ${target.split('@')[0]}`,
+        });
+      } catch (err) {
+        await reply(`Could not fetch profile picture. (${err.message})`);
+      }
       break;
     }
 
