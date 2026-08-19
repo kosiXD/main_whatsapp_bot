@@ -1,7 +1,6 @@
 /* ============================================================
    WhatsApp Bot — single file (Baileys)
    Node 18+ | npm install | node index.js (or npm start)
-   Requires ffmpeg on PATH for video stickers / animated .pic.
    ============================================================ */
 const {
   default: makeWASocket,
@@ -18,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
+const ffmpegPath = require('ffmpeg-static');
 
 const execFileAsync = promisify(execFile);
 const logger = P({ level: 'silent' });
@@ -26,8 +26,8 @@ const logger = P({ level: 'silent' });
 const RESTORE_CHAT = '120363413420187496@g.us';
 
 /* ================= statusStore ================= */
-const recentStatuses = new Map(); // senderJid -> { msg, timestamp }
-const MAX_AGE_MS = 24 * 60 * 60 * 1000; // statuses vanish from WhatsApp itself after 24h
+const recentStatuses = new Map();
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function cacheStatus(msg) {
   const sender = msg.key.participant || msg.key.remoteJid;
@@ -54,8 +54,8 @@ function prune() {
 }
 
 /* ================= AFK ================= */
-let afk = null; // { reason, since, missed }
-const afkReplyAt = new Map(); // chatJid -> last auto-reply timestamp (throttle)
+let afk = null;
+const afkReplyAt = new Map();
 
 function formatDuration(ms) {
   const s = Math.floor(ms / 1000);
@@ -73,7 +73,7 @@ function isOwnerJid(jid, sock) {
 }
 
 /* ================= message cache (anti-delete + .vo) ================= */
-const messageStore = new Map(); // msg id -> { msg, buffer }
+const messageStore = new Map();
 function storeMessage(msg, buffer = null) {
   if (!msg.key?.id || msg.key.fromMe) return;
   if (messageStore.size >= 500) messageStore.delete(messageStore.keys().next().value);
@@ -98,15 +98,13 @@ async function downloadContent(message, type) {
   return Buffer.concat(chunks);
 }
 
-/* ================= restart ================= */
-
+/* ================= ffmpeg check ================= */
 async function checkFfmpeg() {
   try {
-    await execFileAsync('ffmpeg', ['-version']);
+    await execFileAsync(ffmpegPath, ['-version']);
   } catch {
     console.warn(
-      'Warning: ffmpeg was not found on your PATH. .sticker and .pic will work for images ' +
-      'but fail for videos/animated stickers until ffmpeg is installed.'
+      'Warning: ffmpeg-static binary not found. Video stickers and animated .pic may fail.'
     );
   }
 }
@@ -181,7 +179,7 @@ async function toSticker(buffer, isVideo) {
   const input = await toTempFile(buffer, 'mp4');
   const output = input.replace(/\.mp4$/, '.webp');
   try {
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(ffmpegPath, [
       '-y', '-i', input, '-t', '6',
       '-vcodec', 'libwebp',
       '-filter:v', 'fps=15,scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:-1:-1:color=white@0.0',
@@ -196,7 +194,7 @@ async function toSticker(buffer, isVideo) {
 
 async function animatedWebpToMp4(input, output) {
   try {
-    await execFileAsync('ffmpeg', ['-y', '-i', input, '-pix_fmt', 'yuv420p', output]);
+    await execFileAsync(ffmpegPath, ['-y', '-i', input, '-pix_fmt', 'yuv420p', output]);
     return;
   } catch {
     // fall through to ImageMagick frame extraction below
@@ -213,7 +211,7 @@ async function animatedWebpToMp4(input, output) {
       throw new Error('animated sticker conversion needs ffmpeg or ImageMagick ("convert") installed');
     }
     await execFileAsync('convert', [input, path.join(dir, 'frame_%04d.png')]);
-    await execFileAsync('ffmpeg', [
+    await execFileAsync(ffmpegPath, [
       '-y', '-framerate', String(fps), '-i', path.join(dir, 'frame_%04d.png'),
       '-pix_fmt', 'yuv420p', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
       output,
@@ -248,7 +246,7 @@ async function download(sock, msgLike, ctx) {
 async function handleRevoke(sock, msg) {
   try {
     const proto = msg.message.protocolMessage;
-    if (proto.type !== 0) return; // 0 = REVOKE
+    if (proto.type !== 0) return;
     const originalKey = proto.key;
     const stored = messageStore.get(originalKey.id);
     if (!stored) return;
@@ -268,7 +266,6 @@ async function handleRevoke(sock, msg) {
 
     const header = `🚫 *Deleted message restored*\nSender: ${sender}\nChat: ${jid}`;
 
-    // Deliver to configured chat (if any) + self-chat — each guarded, never throws
     const selfJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
     const targets = [RESTORE_CHAT, selfJid].filter(Boolean);
     for (const t of targets) {
@@ -282,7 +279,6 @@ async function handleRevoke(sock, msg) {
       }
     }
 
-    // Always keep a local copy — nothing can be lost
     const restoredDir = path.join(__dirname, 'restored');
     if (!fs.existsSync(restoredDir)) fs.mkdirSync(restoredDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -308,7 +304,7 @@ async function handleRevoke(sock, msg) {
 }
 
 async function handleCommand(sock, msg, ctx) {
-  if (!msg.key.fromMe) return; // owner-only — this bot automates your own account, on purpose
+  if (!msg.key.fromMe) return;
 
   const jid = msg.key.remoteJid;
   const text = getText(msg);
@@ -363,7 +359,7 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    case 'vo': { // view-once → normal media
+    case 'vo': {
       if (!quoted) {
         await reply('Reply to a view-once image/video/voice note with .vo');
         break;
@@ -406,7 +402,7 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    case 'getpp': { // fetch someone's profile picture
+    case 'getpp': {
       let target = quoted?.participant;
       if (!target && args[0]) target = args[0].replace(/\D/g, '') + '@s.whatsapp.net';
       if (!target) {
@@ -443,7 +439,7 @@ async function handleCommand(sock, msg, ctx) {
         break;
       }
       try {
-        await sock.groupParticipantsUpdate(jid, [quoted.participant], cmd); // remove | promote | demote
+        await sock.groupParticipantsUpdate(jid, [quoted.participant], cmd);
         const label = cmd === 'kick' ? '👢 Removed' : cmd === 'promote' ? '⭐ Promoted' : '⬇️ Demoted';
         await reply(`${label} ${quoted.participant.split('@')[0]}.`);
       } catch (err) {
@@ -629,8 +625,6 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg.message) continue;
 
-      // Contact statuses arrive on this JID. View them automatically and
-      // cache them briefly so .savestat has something to re-send.
       if (msg.key.remoteJid === 'status@broadcast') {
         if (msg.key.fromMe) continue;
         try {
@@ -642,21 +636,18 @@ async function startBot() {
         continue;
       }
 
-      // Anti-delete: when someone deletes a message, restore it privately.
       if (msg.message.protocolMessage) {
         await handleRevoke(sock, msg).catch((err) => console.error('Revoke error:', err.message));
         continue;
       }
 
-      // AFK: auto-reply to DMs/mentions while the owner is away,
-      // and auto-return when the owner sends any message.
+      // AFK: auto-reply while away, auto-return when owner sends anything
       if (afk) {
         const t = getText(msg);
         const isAfkCmd = msg.key.fromMe && t.startsWith('.') &&
           t.slice(1).trim().split(/\s+/)[0].toLowerCase() === 'afk';
 
         if (msg.key.fromMe && !isAfkCmd) {
-          // Owner is back
           const { missed } = afk;
           afk = null;
           afkReplyAt.clear();
@@ -676,12 +667,11 @@ async function startBot() {
           if (!isGroup || pinged) {
             afk.missed++;
             const last = afkReplyAt.get(msg.key.remoteJid) || 0;
-            if (Date.now() - last > 60000) { // throttle: max one auto-reply per chat per minute
+            if (Date.now() - last > 60000) {
               afkReplyAt.set(msg.key.remoteJid, Date.now());
               try {
                 await sock.sendMessage(msg.key.remoteJid, {
-                  text:
-                    `Rift is currently unavailable*\n`,
+                  text: `📴 Rift is currently unavailable. Reason: ${afk.reason}.`,
                 });
               } catch (err) {
                 console.error('AFK auto-reply failed:', err.message);
@@ -691,7 +681,7 @@ async function startBot() {
         }
       }
 
-      // Cache every incoming message so .vo and anti-delete can recover it.
+      // Cache messages for .vo and anti-delete
       const vo = getViewOnce(msg.message);
       if (vo) {
         const mediaType = findMediaType(vo);
