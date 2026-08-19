@@ -17,7 +17,15 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
-const ffmpegPath = require('ffmpeg-static');
+let ffmpegPath;
+try {
+  ffmpegPath = require('ffmpeg-static');
+  if (!ffmpegPath || !fs.existsSync(ffmpegPath)) throw new Error('binary missing');
+} catch {
+  // fallback to system ffmpeg (installed via build command)
+  ffmpegPath = 'ffmpeg';
+}
+
 
 const execFileAsync = promisify(execFile);
 const logger = P({ level: 'silent' });
