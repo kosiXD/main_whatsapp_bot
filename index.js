@@ -367,7 +367,7 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    case 'vo': {
+       case 'vo': { // view-once → normal media → sent to owner's DM
       if (!quoted) {
         await reply('Reply to a view-once image/video/voice note with .vo');
         break;
@@ -389,12 +389,19 @@ async function handleCommand(sock, msg, ctx) {
         await reply('Could not read that view-once media (WhatsApp may have blocked it).');
         break;
       }
-      if (type === 'image') await sock.sendMessage(jid, { image: buffer, caption: '📸 View-once → normal' });
-      else if (type === 'video') await sock.sendMessage(jid, { video: buffer, caption: '🎥 View-once → normal' });
-      else if (type === 'audio') await sock.sendMessage(jid, { audio: buffer, ptt: true });
-      else await reply('Unsupported type.');
+      // Send the recovered media to the owner's private DM
+      const selfJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
+      try {
+        if (type === 'image') await sock.sendMessage(selfJid, { image: buffer, caption: '📸 View-once recovered' });
+        else if (type === 'video') await sock.sendMessage(selfJid, { video: buffer, caption: '🎥 View-once recovered' });
+        else if (type === 'audio') await sock.sendMessage(selfJid, { audio: buffer, ptt: true });
+        await reply('✅ View-once sent to your DM.');
+      } catch (err) {
+        await reply(`Failed to send to your DM. (${err.message})`);
+      }
       break;
     }
+
 
     case 'pp': {
       const directType = findMediaType(msg.message);
