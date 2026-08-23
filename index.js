@@ -416,7 +416,7 @@ async function handleCommand(sock, msg, ctx) {
       }
 
       if (sentToDM) {
-        await reply('✅ View-once sent to your DM.');
+        await reply(' ');
       } else {
         try {
           if (type === 'image') await sock.sendMessage(jid, { image: buffer, caption: '📸 View-once recovered' });
