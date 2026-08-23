@@ -22,15 +22,11 @@ try {
   ffmpegPath = require('ffmpeg-static');
   if (!ffmpegPath || !fs.existsSync(ffmpegPath)) throw new Error('binary missing');
 } catch {
-  // fallback to system ffmpeg (installed via build command)
   ffmpegPath = 'ffmpeg';
 }
 
-
 const execFileAsync = promisify(execFile);
 const logger = P({ level: 'silent' });
-/* Where restored messages go. Set to a private group's JID (get it with .jid)
-   for reliable delivery. Leave null to try your self-chat. */
 const RESTORE_CHAT = '120363413420187496@g.us';
 
 /* ================= statusStore ================= */
@@ -80,11 +76,19 @@ function isOwnerJid(jid, sock) {
   return jid === base || `${jid.split(':')[0]}@s.whatsapp.net` === base;
 }
 
-/* ================= message cache (anti-delete + .vo) ================= */
+/* ================= Mute ================= */
+const mutedUsers = new Map();
+
+function isMuted(groupJid, userJid) {
+  const set = mutedUsers.get(groupJid);
+  return set ? set.has(userJid) : false;
+}
+
+/* ================= message cache ================= */
 const messageStore = new Map();
 function storeMessage(msg, buffer = null) {
   if (!msg.key?.id || msg.key.fromMe) return;
-  if (messageStore.size >= 500) messageStore.delete(messageStore.keys().next().value);
+  if (messageStore.size >= 5000) messageStore.delete(messageStore.keys().next().value);
   messageStore.set(msg.key.id, { msg, buffer });
 }
 
@@ -111,9 +115,7 @@ async function checkFfmpeg() {
   try {
     await execFileAsync(ffmpegPath, ['-version']);
   } catch {
-    console.warn(
-      'Warning: ffmpeg-static binary not found. Video stickers and animated .pic may fail.'
-    );
+    console.warn('Warning: ffmpeg not found. Video stickers may fail.');
   }
 }
 
@@ -134,6 +136,9 @@ const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp
 .delete – reply to a message to delete it for everyone (within ~48h)
 .savestat <number> – re-send a contact's most recent status the bot has seen
 .afk [reason] – mark yourself as away; messages/@mentions get an auto-reply
+.mute – reply to a member to auto-delete their messages in this group
+.unmute – reply to a muted member to let them talk again
+.listmute – show all muted members in this group
 .jid – show this chat's ID
 .help – show this message`;
 
@@ -204,9 +209,7 @@ async function animatedWebpToMp4(input, output) {
   try {
     await execFileAsync(ffmpegPath, ['-y', '-i', input, '-pix_fmt', 'yuv420p', output]);
     return;
-  } catch {
-    // fall through to ImageMagick frame extraction below
-  }
+  } catch {}
 
   const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'wa-frames-'));
   try {
@@ -216,7 +219,7 @@ async function animatedWebpToMp4(input, output) {
       const delay = parseInt(stdout.trim().split(/\s+/)[0], 10);
       if (delay > 0) fps = Math.round(100 / delay);
     } catch {
-      throw new Error('animated sticker conversion needs ffmpeg or ImageMagick ("convert") installed');
+      throw new Error('animated sticker needs ffmpeg or ImageMagick');
     }
     await execFileAsync('convert', [input, path.join(dir, 'frame_%04d.png')]);
     await execFileAsync(ffmpegPath, [
@@ -250,7 +253,7 @@ async function download(sock, msgLike, ctx) {
   });
 }
 
-/* ================= anti-delete: restore privately ================= */
+/* ================= anti-delete ================= */
 async function handleRevoke(sock, msg) {
   try {
     const proto = msg.message.protocolMessage;
@@ -273,7 +276,6 @@ async function handleRevoke(sock, msg) {
     else payload = null;
 
     const header = `🚫 *Deleted message restored*\nSender: ${sender}\nChat: ${jid}`;
-
     const selfJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
     const targets = [RESTORE_CHAT, selfJid].filter(Boolean);
     for (const t of targets) {
@@ -281,7 +283,6 @@ async function handleRevoke(sock, msg) {
         await sock.sendMessage(t, { text: header });
         if (payload) await sock.sendMessage(t, payload);
         else await sock.sendMessage(t, { text: '⚠️ (content could not be recovered)' });
-        console.log('📤 Restored message sent to', t);
       } catch (err) {
         console.error('❌ Send to', t, 'failed:', err.message);
       }
@@ -295,16 +296,12 @@ async function handleRevoke(sock, msg) {
       if (payload.text) {
         const file = path.join(restoredDir, `${stamp}_${safeSender}.txt`);
         fs.writeFileSync(file, `Chat: ${jid}\nSender: ${sender}\n\n${payload.text}`);
-        console.log('💾 Saved:', file);
       } else if (payload.image || payload.video || payload.audio || payload.sticker) {
         const buf = payload.image || payload.video || payload.audio || payload.sticker;
         const ext = payload.image ? 'jpg' : payload.video ? 'mp4' : payload.audio ? 'mp3' : 'webp';
         const file = path.join(restoredDir, `${stamp}_${safeSender}.${ext}`);
         fs.writeFileSync(file, buf);
-        console.log('💾 Saved:', file);
       }
-    } else {
-      console.log('⚠️ Nothing recoverable for deleted message from', sender);
     }
   } catch (err) {
     console.error('♻️ anti-delete error:', err.message);
@@ -367,7 +364,7 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-       case 'vo': { // view-once → normal media → sent to owner's DM
+    case 'vo': {
       if (!quoted) {
         await reply('Reply to a view-once image/video/voice note with .vo');
         break;
@@ -386,22 +383,53 @@ async function handleCommand(sock, msg, ctx) {
         }
       }
       if (!buffer || !type) {
-        await reply('Could not read that view-once media (WhatsApp may have blocked it).');
+        await reply('Could not read that view-once media.');
         break;
       }
-      // Send the recovered media to the owner's private DM
-      const selfJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
+
+      const rawId = sock.user.id || '';
+      const ownerNumber = rawId.split(':')[0].split('@')[0];
+      const selfJid = `${ownerNumber}@s.whatsapp.net`;
+
+      let sentToDM = false;
       try {
         if (type === 'image') await sock.sendMessage(selfJid, { image: buffer, caption: '📸 View-once recovered' });
         else if (type === 'video') await sock.sendMessage(selfJid, { video: buffer, caption: '🎥 View-once recovered' });
         else if (type === 'audio') await sock.sendMessage(selfJid, { audio: buffer, ptt: true });
-        await reply('✅ View-once sent to your DM.');
+        else if (type === 'sticker') await sock.sendMessage(selfJid, { sticker: buffer });
+        sentToDM = true;
       } catch (err) {
-        await reply(`Failed to send to your DM. (${err.message})`);
+        console.error('❌ Self-chat DM failed:', err.message);
+      }
+
+      if (!sentToDM && RESTORE_CHAT) {
+        try {
+          await sock.sendMessage(RESTORE_CHAT, { text: `📸 View-once recovered from ${quoted.participant || 'unknown'}` });
+          if (type === 'image') await sock.sendMessage(RESTORE_CHAT, { image: buffer });
+          else if (type === 'video') await sock.sendMessage(RESTORE_CHAT, { video: buffer });
+          else if (type === 'audio') await sock.sendMessage(RESTORE_CHAT, { audio: buffer, ptt: true });
+          else if (type === 'sticker') await sock.sendMessage(RESTORE_CHAT, { sticker: buffer });
+          sentToDM = true;
+        } catch (err) {
+          console.error('❌ RESTORE_CHAT failed:', err.message);
+        }
+      }
+
+      if (sentToDM) {
+        await reply('✅ View-once sent to your DM.');
+      } else {
+        try {
+          if (type === 'image') await sock.sendMessage(jid, { image: buffer, caption: '📸 View-once recovered' });
+          else if (type === 'video') await sock.sendMessage(jid, { video: buffer, caption: '🎥 View-once recovered' });
+          else if (type === 'audio') await sock.sendMessage(jid, { audio: buffer, ptt: true });
+          else if (type === 'sticker') await sock.sendMessage(jid, { sticker: buffer });
+          await reply('⚠️ Could not send to DM — sent here instead.');
+        } catch (err) {
+          await reply(`❌ Failed to send view-once anywhere. (${err.message})`);
+        }
       }
       break;
     }
-
 
     case 'pp': {
       const directType = findMediaType(msg.message);
@@ -484,10 +512,7 @@ async function handleCommand(sock, msg, ctx) {
         break;
       }
       const name = args.join(' ');
-      if (!name) {
-        await reply('Usage: .setname <new group name>');
-        break;
-      }
+      if (!name) { await reply('Usage: .setname <new group name>'); break; }
       try {
         await sock.groupUpdateSubject(jid, name);
         await reply(`📛 Group name set to "${name}".`);
@@ -503,10 +528,7 @@ async function handleCommand(sock, msg, ctx) {
         break;
       }
       const desc = args.join(' ');
-      if (!desc) {
-        await reply('Usage: .setdesc <new group description>');
-        break;
-      }
+      if (!desc) { await reply('Usage: .setdesc <new group description>'); break; }
       try {
         await sock.groupUpdateDescription(jid, desc);
         await reply('📝 Group description updated.');
@@ -552,7 +574,7 @@ async function handleCommand(sock, msg, ctx) {
 
     case 'delete': {
       if (!quoted) {
-        await reply('Reply to a message with .delete to remove it for everyone (within ~48h of sending).');
+        await reply('Reply to a message with .delete to remove it for everyone (within ~48h).');
         break;
       }
       const ownJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
@@ -591,6 +613,53 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
+    case 'mute': {
+      if (!jid.endsWith('@g.us')) {
+        await reply('.mute only works inside a group.');
+        break;
+      }
+      const target = quoted?.participant;
+      if (!target) {
+        await reply('Reply to the member\'s message with .mute to silence them.');
+        break;
+      }
+      if (!mutedUsers.has(jid)) mutedUsers.set(jid, new Set());
+      mutedUsers.get(jid).add(target);
+      await reply(`🔇 Muted ${target.split('@')[0]} in this group.`);
+      break;
+    }
+
+    case 'unmute': {
+      if (!jid.endsWith('@g.us')) {
+        await reply('.unmute only works inside a group.');
+        break;
+      }
+      const target = quoted?.participant;
+      if (!target) {
+        await reply('Reply to the muted member\'s message with .unmute.');
+        break;
+      }
+      const set = mutedUsers.get(jid);
+      if (set) set.delete(target);
+      await reply(`🔊 Unmuted ${target.split('@')[0]} in this group.`);
+      break;
+    }
+
+    case 'listmute': {
+      if (!jid.endsWith('@g.us')) {
+        await reply('.listmute only works inside a group.');
+        break;
+      }
+      const set = mutedUsers.get(jid);
+      if (!set || set.size === 0) {
+        await reply('No muted members in this group.');
+        break;
+      }
+      const list = [...set].map((j) => `• ${j.split('@')[0]}`).join('\n');
+      await reply(`🔇 *Muted members:*\n${list}`);
+      break;
+    }
+
     case 'jid': {
       await reply(`This chat's JID: ${jid}`);
       break;
@@ -626,7 +695,7 @@ async function startBot() {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       console.log(
         'Connection closed.',
-        loggedOut ? 'Logged out — delete the auth_session/ folder and re-scan.' : 'Reconnecting…'
+        loggedOut ? 'Logged out — delete auth_session/ and re-scan.' : 'Reconnecting…'
       );
       if (!loggedOut) startBot();
     } else if (connection === 'open') {
@@ -640,23 +709,38 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg.message) continue;
 
+      // Statuses
       if (msg.key.remoteJid === 'status@broadcast') {
         if (msg.key.fromMe) continue;
-        try {
-          await sock.readMessages([msg.key]);
-        } catch (err) {
-          console.error('Could not mark status as viewed:', err.message);
-        }
+        try { await sock.readMessages([msg.key]); } catch {}
         cacheStatus(msg);
         continue;
       }
 
+      // Anti-delete
       if (msg.message.protocolMessage) {
         await handleRevoke(sock, msg).catch((err) => console.error('Revoke error:', err.message));
         continue;
       }
 
-      // AFK: auto-reply while away, auto-return when owner sends anything
+      // Mute check — delete muted user messages instantly
+      if (msg.key.remoteJid.endsWith('@g.us') && !msg.key.fromMe) {
+        if (isMuted(msg.key.remoteJid, msg.key.participant)) {
+          try {
+            await sock.sendMessage(msg.key.remoteJid, {
+              delete: {
+                remoteJid: msg.key.remoteJid,
+                id: msg.key.id,
+                fromMe: false,
+                participant: msg.key.participant,
+              },
+            });
+          } catch {}
+          continue;
+        }
+      }
+
+      // AFK
       if (afk) {
         const t = getText(msg);
         const isAfkCmd = msg.key.fromMe && t.startsWith('.') &&
@@ -672,9 +756,7 @@ async function startBot() {
                 ? `👋 Welcome back! You were away — ${missed} message(s) pinged you.`
                 : `👋 Welcome back! You're no longer AFK.`,
             });
-          } catch (err) {
-            console.error('AFK return message failed:', err.message);
-          }
+          } catch {}
         } else if (!msg.key.fromMe) {
           const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
           const isGroup = msg.key.remoteJid.endsWith('@g.us');
@@ -688,21 +770,36 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, {
                   text: `📴 Rift is currently unavailable. Reason: ${afk.reason}.`,
                 });
-              } catch (err) {
-                console.error('AFK auto-reply failed:', err.message);
-              }
+              } catch {}
             }
           }
         }
       }
 
-      // Cache messages for .vo and anti-delete
+      // Cache messages + auto-save view-once to disk
       const vo = getViewOnce(msg.message);
       if (vo) {
         const mediaType = findMediaType(vo);
         if (mediaType && TYPE_DL[mediaType]) {
           const buffer = await downloadContent(vo[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
           storeMessage(msg, buffer);
+
+          // Auto-save view-once to disk immediately
+          if (buffer) {
+            try {
+              const recoveredDir = path.join(__dirname, 'recovered');
+              if (!fs.existsSync(recoveredDir)) fs.mkdirSync(recoveredDir, { recursive: true });
+              const sender = (msg.key.participant || msg.key.remoteJid || 'unknown').split('@')[0];
+              const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+              const safeSender = sender.replace(/[^a-zA-Z0-9._-]/g, '_');
+              const ext = mediaType === 'image' ? 'jpg' : mediaType === 'video' ? 'mp4' : mediaType === 'audio' ? 'ogg' : 'bin';
+              const file = path.join(recoveredDir, `${stamp}_${safeSender}_viewonce.${ext}`);
+              fs.writeFileSync(file, buffer);
+              console.log('📸 Auto-saved view-once:', file);
+            } catch (err) {
+              console.error('Auto-save view-once failed:', err.message);
+            }
+          }
         }
       } else {
         const mediaType = findMediaType(msg.message);
