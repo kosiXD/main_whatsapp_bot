@@ -76,15 +76,54 @@ function isOwnerJid(jid, sock) {
   return jid === base || `${jid.split(':')[0]}@s.whatsapp.net` === base;
 }
 
-/* ================= Mute ================= */
-const mutedUsers = new Map(); // groupJid -> Set of muted JIDs
+/* ================= MUTE SYSTEM ================= */
+// mutedUsers: Map<groupJid, Set<participantJid>> — persisted to disk
+const MUTED_FILE = path.join(__dirname, 'data', 'muted-users.json');
+const mutedUsers = new Map(); // groupJid -> Set of muted participant JIDs
 
-function isMuted(groupJid, userJid) {
-  const set = mutedUsers.get(groupJid);
-  return set ? set.has(userJid) : false;
+function loadMuted() {
+  try {
+    if (fs.existsSync(MUTED_FILE)) {
+      const raw = fs.readJsonSync(MUTED_FILE);
+      for (const [group, members] of Object.entries(raw)) {
+        mutedUsers.set(group, new Set(members));
+      }
+    }
+  } catch {}
 }
 
-/* ================= message cache ================= */
+function saveMuted() {
+  try {
+    const obj = {};
+    for (const [group, members] of mutedUsers) {
+      obj[group] = [...members];
+    }
+    fs.mkdirSync(path.dirname(MUTED_FILE), { recursive: true });
+    fs.writeFileSync(MUTED_FILE, JSON.stringify(obj, null, 2));
+  } catch {}
+}
+
+function isMuted(groupJid, participantJid) {
+  const set = mutedUsers.get(groupJid);
+  return set ? set.has(participantJid) : false;
+}
+
+function setMuted(groupJid, participantJid, mute) {
+  if (!mutedUsers.has(groupJid)) mutedUsers.set(groupJid, new Set());
+  const set = mutedUsers.get(groupJid);
+  if (mute) {
+    set.add(participantJid);
+  } else {
+    set.delete(participantJid);
+    if (set.size === 0) mutedUsers.delete(groupJid);
+  }
+  saveMuted();
+}
+
+// Initialize on startup
+loadMuted();
+
+/* ================= message cache (anti-delete + .vo) ================= */
 const messageStore = new Map();
 function storeMessage(msg, buffer = null) {
   if (!msg.key?.id || msg.key.fromMe) return;
@@ -115,30 +154,28 @@ async function checkFfmpeg() {
   try {
     await execFileAsync(ffmpegPath, ['-version']);
   } catch {
-    console.warn('Warning: ffmpeg-static binary not found. Video stickers may fail.');
+    console.warn('Warning: ffmpeg-static binary not found. Video stickers and animated .pic may fail.');
   }
 }
 
 /* ================= commands ================= */
 const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp)
 
-.sticker – reply to (or caption) an image/video → sticker
-.pic – reply to a sticker → image/video
-.vo – reply to a view-once → recover it to your DM
-.pp – reply to an image → set as profile picture
-.getpp – reply to a message (or ".getpp <number>") → fetch profile picture
-.kick / .promote / .demote – reply to a member's message (group admin)
-.lock / .unlock – restrict / allow everyone to talk (group)
+.sticker – reply to (or caption) an image/video to turn it into a sticker
+.pic – reply to a sticker to convert it back to an image/video
+.vo – reply to a view-once image/video/voice note to save it as normal
+.pp – reply to an image to set it as your profile picture
+.getpp – reply to a message (or ".getpp <number>") to fetch their profile picture
+.kick / .promote / .demote – reply to a member's message (bot must be group admin)
+.lock / .unlock – restrict / allow everyone to talk in the group
 .setname <name> – change group name
 .setdesc <desc> – change group description
-.seticon – reply to an image → change group icon
+.seticon – reply to an image to change the group icon
 .tagall [message] – mention all group members
-.delete – reply to a message → delete for everyone
-.savestat <number> – re-send a contact's recent status
-.mute – reply to a member's message to silence them (group)
-.unmute – reply to a member's message to unmute them (group)
-.listmute – show all muted members in this group
-.afk [reason] – mark yourself as away
+.mute @user / .unmute @user – mute/unmute someone (their messages get auto-deleted in groups)
+.delete – reply to a message to delete it for everyone (within ~48h)
+.savestat <number> – re-send a contact's most recent status the bot has seen
+.afk [reason] – mark yourself as away; messages/@mentions get an auto-reply
 .jid – show this chat's ID
 .help – show this message`;
 
@@ -219,7 +256,7 @@ async function animatedWebpToMp4(input, output) {
       const delay = parseInt(stdout.trim().split(/\s+/)[0], 10);
       if (delay > 0) fps = Math.round(100 / delay);
     } catch {
-      throw new Error('animated sticker conversion needs ffmpeg or ImageMagick');
+      throw new Error('animated sticker conversion needs ffmpeg or ImageMagick ("convert") installed');
     }
     await execFileAsync('convert', [input, path.join(dir, 'frame_%04d.png')]);
     await execFileAsync(ffmpegPath, [
@@ -253,7 +290,7 @@ async function download(sock, msgLike, ctx) {
   });
 }
 
-/* ================= anti-delete ================= */
+/* ================= anti-delete: restore privately ================= */
 async function handleRevoke(sock, msg) {
   try {
     const proto = msg.message.protocolMessage;
@@ -276,6 +313,7 @@ async function handleRevoke(sock, msg) {
     else payload = null;
 
     const header = `🚫 *Deleted message restored*\nSender: ${sender}\nChat: ${jid}`;
+
     const selfJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
     const targets = [RESTORE_CHAT, selfJid].filter(Boolean);
     for (const t of targets) {
@@ -283,6 +321,7 @@ async function handleRevoke(sock, msg) {
         await sock.sendMessage(t, { text: header });
         if (payload) await sock.sendMessage(t, payload);
         else await sock.sendMessage(t, { text: '⚠️ (content could not be recovered)' });
+        console.log('📤 Restored message sent to', t);
       } catch (err) {
         console.error('❌ Send to', t, 'failed:', err.message);
       }
@@ -294,19 +333,24 @@ async function handleRevoke(sock, msg) {
     const safeSender = String(sender).replace(/[^a-zA-Z0-9@._-]/g, '_');
     if (payload) {
       if (payload.text) {
-        fs.writeFileSync(path.join(restoredDir, `${stamp}_${safeSender}.txt`), `Chat: ${jid}\nSender: ${sender}\n\n${payload.text}`);
+        const file = path.join(restoredDir, `${stamp}_${safeSender}.txt`);
+        fs.writeFileSync(file, `Chat: ${jid}\nSender: ${sender}\n\n${payload.text}`);
+        console.log('💾 Saved:', file);
       } else if (payload.image || payload.video || payload.audio || payload.sticker) {
         const buf = payload.image || payload.video || payload.audio || payload.sticker;
         const ext = payload.image ? 'jpg' : payload.video ? 'mp4' : payload.audio ? 'mp3' : 'webp';
-        fs.writeFileSync(path.join(restoredDir, `${stamp}_${safeSender}.${ext}`), buf);
+        const file = path.join(restoredDir, `${stamp}_${safeSender}.${ext}`);
+        fs.writeFileSync(file, buf);
+        console.log('💾 Saved:', file);
       }
+    } else {
+      console.log('⚠️ Nothing recoverable for deleted message from', sender);
     }
   } catch (err) {
     console.error('♻️ anti-delete error:', err.message);
   }
 }
 
-/* ================= command handler ================= */
 async function handleCommand(sock, msg, ctx) {
   if (!msg.key.fromMe) return;
 
@@ -333,6 +377,52 @@ async function handleCommand(sock, msg, ctx) {
         `📴 You're now AFK: ${reason}\n` +
         `I'll auto-reply to anyone who messages or @mentions you. Send any message to come back.`
       );
+      break;
+    }
+
+    case 'mute': {
+      if (!jid.endsWith('@g.us')) {
+        await reply('.mute only works inside a group.');
+        break;
+      }
+      let target = quoted?.participant;
+      if (!target && args[0]) {
+        const num = args[0].replace(/\D/g, '');
+        if (num) target = num + '@s.whatsapp.net';
+      }
+      if (!target) {
+        await reply('Reply to their message with .mute, or .mute <number>');
+        break;
+      }
+      if (isOwnerJid(target, sock)) {
+        await reply('🚫 You can\'t mute yourself.');
+        break;
+      }
+      setMuted(jid, target, true);
+      await reply(`🔇 Muted ${target.split('@')[0]} in this group. Their messages will be auto-deleted.`);
+      break;
+    }
+
+    case 'unmute': {
+      if (!jid.endsWith('@g.us')) {
+        await reply('.unmute only works inside a group.');
+        break;
+      }
+      let target = quoted?.participant;
+      if (!target && args[0]) {
+        const num = args[0].replace(/\D/g, '');
+        if (num) target = num + '@s.whatsapp.net';
+      }
+      if (!target) {
+        await reply('Reply to their message with .unmute, or .unmute <number>');
+        break;
+      }
+      if (!isMuted(jid, target)) {
+        await reply(`${target.split('@')[0]} is not muted.`);
+        break;
+      }
+      setMuted(jid, target, false);
+      await reply(`🔊 Unmuted ${target.split('@')[0]} in this group.`);
       break;
     }
 
@@ -389,6 +479,8 @@ async function handleCommand(sock, msg, ctx) {
       const rawId = sock.user.id || '';
       const ownerNumber = rawId.split(':')[0].split('@')[0];
       const selfJid = `${ownerNumber}@s.whatsapp.net`;
+      console.log('📤 Attempting to send view-once to:', selfJid);
+
       let sentToDM = false;
 
       try {
@@ -397,6 +489,7 @@ async function handleCommand(sock, msg, ctx) {
         else if (type === 'audio') await sock.sendMessage(selfJid, { audio: buffer, ptt: true });
         else if (type === 'sticker') await sock.sendMessage(selfJid, { sticker: buffer });
         sentToDM = true;
+        console.log('✅ Sent to self-chat DM:', selfJid);
       } catch (err) {
         console.error('❌ Self-chat DM failed:', err.message);
       }
@@ -410,6 +503,7 @@ async function handleCommand(sock, msg, ctx) {
           else if (type === 'audio') await sock.sendMessage(RESTORE_CHAT, { audio: buffer, ptt: true });
           else if (type === 'sticker') await sock.sendMessage(RESTORE_CHAT, { sticker: buffer });
           sentToDM = true;
+          console.log('✅ Sent to RESTORE_CHAT:', RESTORE_CHAT);
         } catch (err) {
           console.error('❌ RESTORE_CHAT failed:', err.message);
         }
@@ -470,60 +564,6 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    /* ====== MUTE / UNMUTE / LISTMUTE ====== */
-
-    case 'mute': {
-      if (!jid.endsWith('@g.us')) {
-        await reply('.mute only works inside a group.');
-        break;
-      }
-      if (!quoted?.participant) {
-        await reply('Reply to the member\'s message with .mute to silence them.');
-        break;
-      }
-      if (!mutedUsers.has(jid)) mutedUsers.set(jid, new Set());
-      mutedUsers.get(jid).add(quoted.participant);
-      await reply(`🔇 Muted ${quoted.participant.split('@')[0]} in this group. Their messages will be auto-deleted.`);
-      break;
-    }
-
-    case 'unmute': {
-      if (!jid.endsWith('@g.us')) {
-        await reply('.unmute only works inside a group.');
-        break;
-      }
-      if (!quoted?.participant) {
-        await reply('Reply to the member\'s message with .unmute to let them talk again.');
-        break;
-      }
-      const set = mutedUsers.get(jid);
-      if (set && set.has(quoted.participant)) {
-        set.delete(quoted.participant);
-        if (set.size === 0) mutedUsers.delete(jid);
-        await reply(`🔊 Unmuted ${quoted.participant.split('@')[0]}. They can talk again.`);
-      } else {
-        await reply(`${quoted.participant.split('@')[0]} is not muted.`);
-      }
-      break;
-    }
-
-    case 'listmute': {
-      if (!jid.endsWith('@g.us')) {
-        await reply('.listmute only works inside a group.');
-        break;
-      }
-      const muted = mutedUsers.get(jid);
-      if (!muted || muted.size === 0) {
-        await reply('No one is muted in this group.');
-        break;
-      }
-      const list = [...muted].map((j, i) => `${i + 1}. @${j.split('@')[0]}`).join('\n');
-      await sock.sendMessage(jid, { text: `🔇 *Muted members (${muted.size})*\n\n${list}`, mentions: [...muted] });
-      break;
-    }
-
-    /* ====== END MUTE ====== */
-
     case 'kick':
     case 'promote':
     case 'demote': {
@@ -566,11 +606,16 @@ async function handleCommand(sock, msg, ctx) {
         break;
       }
       const name = args.join(' ');
-      if (!name) { await reply('Usage: .setname <new group name>'); break; }
+      if (!name) {
+        await reply('Usage: .setname <new group name>');
+        break;
+      }
       try {
         await sock.groupUpdateSubject(jid, name);
         await reply(`📛 Group name set to "${name}".`);
-      } catch (err) { await reply(`Could not change group name. (${err.message})`); }
+      } catch (err) {
+        await reply(`Could not change group name. (${err.message})`);
+      }
       break;
     }
 
@@ -580,11 +625,16 @@ async function handleCommand(sock, msg, ctx) {
         break;
       }
       const desc = args.join(' ');
-      if (!desc) { await reply('Usage: .setdesc <new group description>'); break; }
+      if (!desc) {
+        await reply('Usage: .setdesc <new group description>');
+        break;
+      }
       try {
         await sock.groupUpdateDescription(jid, desc);
         await reply('📝 Group description updated.');
-      } catch (err) { await reply(`Could not change group description. (${err.message})`); }
+      } catch (err) {
+        await reply(`Could not change group description. (${err.message})`);
+      }
       break;
     }
 
@@ -616,13 +666,15 @@ async function handleCommand(sock, msg, ctx) {
         const mentions = meta.participants.map((p) => p.id);
         const text = `📢 *@${meta.participants.length} members*` + (args.length ? `\n\n${args.join(' ')}` : '');
         await sock.sendMessage(jid, { text, mentions });
-      } catch (err) { await reply(`Could not tag members. (${err.message})`); }
+      } catch (err) {
+        await reply(`Could not tag members. (${err.message})`);
+      }
       break;
     }
 
     case 'delete': {
       if (!quoted) {
-        await reply('Reply to a message with .delete to remove it for everyone.');
+        await reply('Reply to a message with .delete to remove it for everyone (within ~48h of sending).');
         break;
       }
       const ownJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
@@ -640,11 +692,20 @@ async function handleCommand(sock, msg, ctx) {
 
     case 'savestat': {
       const number = (args[0] || '').replace(/\D/g, '');
-      if (!number) { await reply('Usage: .savestat <number>'); break; }
+      if (!number) {
+        await reply('Usage: .savestat <number> — works for statuses the bot has seen since it last started.');
+        break;
+      }
       const cached = getRecentStatus(`${number}@s.whatsapp.net`);
-      if (!cached) { await reply('No recent status cached for that number.'); break; }
+      if (!cached) {
+        await reply('No recent status cached for that number.');
+        break;
+      }
       const type = findMediaType(cached.message);
-      if (!type || type === 'sticker') { await reply('That status was text-only or unsupported.'); break; }
+      if (!type || type === 'sticker') {
+        await reply('That status was text-only, or an unsupported type.');
+        break;
+      }
       const buffer = await download(sock, cached, ctx);
       if (type === 'video') await sock.sendMessage(jid, { video: buffer });
       else if (type === 'audio') await sock.sendMessage(jid, { audio: buffer, ptt: true });
@@ -678,14 +739,17 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log('Scan this QR code:');
+      console.log('Scan this QR code in WhatsApp > Linked Devices > Link a Device:');
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log('Connection closed.', loggedOut ? 'Logged out.' : 'Reconnecting…');
+      console.log(
+        'Connection closed.',
+        loggedOut ? 'Logged out — delete the auth_session/ folder and re-scan.' : 'Reconnecting…'
+      );
       if (!loggedOut) startBot();
     } else if (connection === 'open') {
       console.log('Connected to WhatsApp.');
@@ -698,10 +762,14 @@ async function startBot() {
     for (const msg of messages) {
       if (!msg.message) continue;
 
-      // Status viewing + caching
+      // Status viewing + cache
       if (msg.key.remoteJid === 'status@broadcast') {
         if (msg.key.fromMe) continue;
-        try { await sock.readMessages([msg.key]); } catch {}
+        try {
+          await sock.readMessages([msg.key]);
+        } catch (err) {
+          console.error('Could not mark status as viewed:', err.message);
+        }
         cacheStatus(msg);
         continue;
       }
@@ -712,9 +780,9 @@ async function startBot() {
         continue;
       }
 
-      // ====== MUTE ENFORCEMENT: auto-delete muted users' messages ======
+      // ============ MUTE: auto-delete messages from muted users ============
       if (!msg.key.fromMe && msg.key.remoteJid.endsWith('@g.us')) {
-        const sender = msg.key.participant || msg.key.remoteJid;
+        const sender = msg.key.participant || '';
         if (isMuted(msg.key.remoteJid, sender)) {
           try {
             await sock.sendMessage(msg.key.remoteJid, {
@@ -725,14 +793,15 @@ async function startBot() {
                 participant: sender,
               },
             });
+            console.log(`🔇 Auto-deleted message from muted user: ${sender.split('@')[0]}`);
           } catch (err) {
-            console.error('Failed to delete muted message:', err.message);
+            console.error('Mute auto-delete failed:', err.message);
           }
           continue; // skip all further processing for this message
         }
       }
 
-      // AFK auto-reply
+      // AFK: auto-reply while away, auto-return when owner sends anything
       if (afk) {
         const t = getText(msg);
         const isAfkCmd = msg.key.fromMe && t.startsWith('.') &&
@@ -748,7 +817,9 @@ async function startBot() {
                 ? `👋 Welcome back! You were away — ${missed} message(s) pinged you.`
                 : `👋 Welcome back! You're no longer AFK.`,
             });
-          } catch {}
+          } catch (err) {
+            console.error('AFK return message failed:', err.message);
+          }
         } else if (!msg.key.fromMe) {
           const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
           const isGroup = msg.key.remoteJid.endsWith('@g.us');
@@ -762,41 +833,5 @@ async function startBot() {
                 await sock.sendMessage(msg.key.remoteJid, {
                   text: `📴 Rift is currently unavailable. Reason: ${afk.reason}.`,
                 });
-              } catch {}
-            }
-          }
-        }
-      }
-
-      // Cache messages for .vo and anti-delete
-      const vo = getViewOnce(msg.message);
-      if (vo) {
-        const mediaType = findMediaType(vo);
-        if (mediaType && TYPE_DL[mediaType]) {
-          const buffer = await downloadContent(vo[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
-          storeMessage(msg, buffer);
-        }
-      } else {
-        const mediaType = findMediaType(msg.message);
-        if (mediaType && TYPE_DL[mediaType] && msg.message[mediaType + 'Message']) {
-          const buffer = await downloadContent(msg.message[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
-          storeMessage(msg, buffer);
-        } else {
-          storeMessage(msg);
-        }
-      }
-
-      try {
-        await handleCommand(sock, msg, { logger });
-      } catch (err) {
-        console.error('Command error:', err.message);
-      }
-    }
-  });
-}
-
-checkFfmpeg();
-startBot().catch((err) => {
-  console.error('Failed to start:', err);
-  process.exit(1);
-});
+              } catch (err) {
+                console.error('AFK auto-reply failed:', err.message);
