@@ -77,14 +77,13 @@ function isOwnerJid(jid, sock) {
 }
 
 /* ================= MUTE SYSTEM ================= */
-// mutedUsers: Map<groupJid, Set<participantJid>> — persisted to disk
 const MUTED_FILE = path.join(__dirname, 'data', 'muted-users.json');
-const mutedUsers = new Map(); // groupJid -> Set of muted participant JIDs
+const mutedUsers = new Map();
 
 function loadMuted() {
   try {
     if (fs.existsSync(MUTED_FILE)) {
-      const raw = fs.readJsonSync(MUTED_FILE);
+      const raw = JSON.parse(fs.readFileSync(MUTED_FILE, 'utf8'));
       for (const [group, members] of Object.entries(raw)) {
         mutedUsers.set(group, new Set(members));
       }
@@ -120,14 +119,13 @@ function setMuted(groupJid, participantJid, mute) {
   saveMuted();
 }
 
-// Initialize on startup
 loadMuted();
 
 /* ================= message cache (anti-delete + .vo) ================= */
 const messageStore = new Map();
 function storeMessage(msg, buffer = null) {
   if (!msg.key?.id || msg.key.fromMe) return;
-  if (messageStore.size >= 500) messageStore.delete(messageStore.keys().next().value);
+  if (messageStore.size >= 5000) messageStore.delete(messageStore.keys().next().value);
   messageStore.set(msg.key.id, { msg, buffer });
 }
 
@@ -167,6 +165,7 @@ const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp
 .pp – reply to an image to set it as your profile picture
 .getpp – reply to a message (or ".getpp <number>") to fetch their profile picture
 .kick / .promote / .demote – reply to a member's message (bot must be group admin)
+.disband – kick out ALL group members at once (confirm with .disband yes)
 .lock / .unlock – restrict / allow everyone to talk in the group
 .setname <name> – change group name
 .setdesc <desc> – change group description
@@ -313,7 +312,6 @@ async function handleRevoke(sock, msg) {
     else payload = null;
 
     const header = `🚫 *Deleted message restored*\nSender: ${sender}\nChat: ${jid}`;
-
     const selfJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
     const targets = [RESTORE_CHAT, selfJid].filter(Boolean);
     for (const t of targets) {
@@ -479,8 +477,6 @@ async function handleCommand(sock, msg, ctx) {
       const rawId = sock.user.id || '';
       const ownerNumber = rawId.split(':')[0].split('@')[0];
       const selfJid = `${ownerNumber}@s.whatsapp.net`;
-      console.log('📤 Attempting to send view-once to:', selfJid);
-
       let sentToDM = false;
 
       try {
@@ -489,21 +485,18 @@ async function handleCommand(sock, msg, ctx) {
         else if (type === 'audio') await sock.sendMessage(selfJid, { audio: buffer, ptt: true });
         else if (type === 'sticker') await sock.sendMessage(selfJid, { sticker: buffer });
         sentToDM = true;
-        console.log('✅ Sent to self-chat DM:', selfJid);
       } catch (err) {
         console.error('❌ Self-chat DM failed:', err.message);
       }
 
       if (!sentToDM && RESTORE_CHAT) {
         try {
-          const header = `📸 View-once recovered from ${quoted.participant || 'unknown'}`;
-          await sock.sendMessage(RESTORE_CHAT, { text: header });
+          await sock.sendMessage(RESTORE_CHAT, { text: `📸 View-once recovered from ${quoted.participant || 'unknown'}` });
           if (type === 'image') await sock.sendMessage(RESTORE_CHAT, { image: buffer });
           else if (type === 'video') await sock.sendMessage(RESTORE_CHAT, { video: buffer });
           else if (type === 'audio') await sock.sendMessage(RESTORE_CHAT, { audio: buffer, ptt: true });
           else if (type === 'sticker') await sock.sendMessage(RESTORE_CHAT, { sticker: buffer });
           sentToDM = true;
-          console.log('✅ Sent to RESTORE_CHAT:', RESTORE_CHAT);
         } catch (err) {
           console.error('❌ RESTORE_CHAT failed:', err.message);
         }
@@ -554,10 +547,7 @@ async function handleCommand(sock, msg, ctx) {
         }
         const res = await fetch(url);
         const buffer = Buffer.from(await res.arrayBuffer());
-        await sock.sendMessage(jid, {
-          image: buffer,
-          caption: `🖼️ Profile picture of ${target.split('@')[0]}`,
-        });
+        await sock.sendMessage(jid, { image: buffer, caption: `🖼️ Profile picture of ${target.split('@')[0]}` });
       } catch (err) {
         await reply(`Could not fetch profile picture. (${err.message})`);
       }
@@ -581,6 +571,54 @@ async function handleCommand(sock, msg, ctx) {
         await reply(`${label} ${quoted.participant.split('@')[0]}.`);
       } catch (err) {
         await reply(`Could not ${cmd} them — make sure the bot account is a group admin. (${err.message})`);
+      }
+      break;
+    }
+
+    case 'disband': {
+      if (!jid.endsWith('@g.us')) {
+        await reply('.disband only works inside a group.');
+        break;
+      }
+      if ((args[0] || '').toLowerCase() !== 'yes') {
+        await reply('⚠️ This will remove ALL members from this group. Send `.disband yes` to confirm.');
+        break;
+      }
+      try {
+        await reply('🔨 Disbanding group — removing all members…');
+        const meta = await sock.groupMetadata(jid);
+        const botJid = `${sock.user.id.split(':')[0]}@s.whatsapp.net`;
+        const ownerJid = meta.owner || '';
+        const participants = meta.participants
+          .map(p => p.id)
+          .filter(id => id !== botJid && id !== ownerJid);
+
+        if (participants.length === 0) {
+          await reply('No members to remove.');
+          break;
+        }
+
+        const BATCH = 10;
+        let removed = 0;
+        let failed = 0;
+
+        for (let i = 0; i < participants.length; i += BATCH) {
+          const batch = participants.slice(i, i + BATCH);
+          try {
+            await sock.groupParticipantsUpdate(jid, batch, 'remove');
+            removed += batch.length;
+          } catch (err) {
+            failed += batch.length;
+            console.error('Disband batch failed:', err.message);
+          }
+          if (i + BATCH < participants.length) {
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
+
+        await reply(`✅ Disband complete:\n👥 Removed: ${removed}\n❌ Failed: ${failed}`);
+      } catch (err) {
+        await reply(`❌ Could not disband group. (${err.message})`);
       }
       break;
     }
@@ -780,7 +818,7 @@ async function startBot() {
         continue;
       }
 
-      // ============ MUTE: auto-delete messages from muted users ============
+      // MUTE: auto-delete messages from muted users
       if (!msg.key.fromMe && msg.key.remoteJid.endsWith('@g.us')) {
         const sender = msg.key.participant || '';
         if (isMuted(msg.key.remoteJid, sender)) {
@@ -793,11 +831,10 @@ async function startBot() {
                 participant: sender,
               },
             });
-            console.log(`🔇 Auto-deleted message from muted user: ${sender.split('@')[0]}`);
           } catch (err) {
             console.error('Mute auto-delete failed:', err.message);
           }
-          continue; // skip all further processing for this message
+          continue;
         }
       }
 
@@ -835,3 +872,55 @@ async function startBot() {
                 });
               } catch (err) {
                 console.error('AFK auto-reply failed:', err.message);
+              }
+            }
+          }
+        }
+      }
+
+      // Cache messages for .vo and anti-delete
+      const vo = getViewOnce(msg.message);
+      if (vo) {
+        const mediaType = findMediaType(vo);
+        if (mediaType && TYPE_DL[mediaType]) {
+          const buffer = await downloadContent(vo[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
+          storeMessage(msg, buffer);
+          // Auto-save view-once to disk
+          try {
+            const recoveredDir = path.join(__dirname, 'recovered');
+            if (!fs.existsSync(recoveredDir)) fs.mkdirSync(recoveredDir, { recursive: true });
+            const sender = (msg.key.participant || msg.key.remoteJid || 'unknown').split('@')[0];
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const safeSender = sender.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const ext = mediaType === 'image' ? 'jpg' : mediaType === 'video' ? 'mp4' : mediaType === 'audio' ? 'ogg' : 'bin';
+            const file = path.join(recoveredDir, `${stamp}_${safeSender}_viewonce.${ext}`);
+            fs.writeFileSync(file, buffer);
+            console.log('📸 Auto-saved view-once:', file);
+          } catch (err) {
+            console.error('Auto-save view-once failed:', err.message);
+          }
+        }
+      } else {
+        const mediaType = findMediaType(msg.message);
+        if (mediaType && TYPE_DL[mediaType] && msg.message[mediaType + 'Message']) {
+          const buffer = await downloadContent(msg.message[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
+          storeMessage(msg, buffer);
+        } else {
+          storeMessage(msg);
+        }
+      }
+
+      try {
+        await handleCommand(sock, msg, { logger });
+      } catch (err) {
+        console.error('Command error:', err.message);
+      }
+    }
+  });
+}
+
+checkFfmpeg();
+startBot().catch((err) => {
+  console.error('Failed to start:', err);
+  process.exit(1);
+});
