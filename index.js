@@ -378,51 +378,96 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    case 'mute': {
+        case 'mute': {
       if (!jid.endsWith('@g.us')) {
         await reply('.mute only works inside a group.');
         break;
       }
-      let target = quoted?.participant;
-      if (!target && args[0]) {
+      let targets = [];
+      
+      // Check for mentioned JIDs (tagged users)
+      const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+      if (mentionedJids.length > 0) {
+        targets = mentionedJids;
+      }
+      // Fallback: check quoted message
+      else if (quoted?.participant) {
+        targets = [quoted.participant];
+      }
+      // Fallback: check number argument
+      else if (args[0]) {
         const num = args[0].replace(/\D/g, '');
-        if (num) target = num + '@s.whatsapp.net';
+        if (num) targets = [num + '@s.whatsapp.net'];
       }
-      if (!target) {
-        await reply('Reply to their message with .mute, or .mute <number>');
+      
+      if (targets.length === 0) {
+        await reply('Reply to their message, tag them with @, or use .mute <number>');
         break;
       }
-      if (isOwnerJid(target, sock)) {
-        await reply('🚫 You can\'t mute yourself.');
-        break;
+      
+      let muted = 0;
+      for (const target of targets) {
+        if (isOwnerJid(target, sock)) continue;
+        setMuted(jid, target, true);
+        muted++;
       }
-      setMuted(jid, target, true);
-      await reply(`🔇 Muted ${target.split('@')[0]} in this group. Their messages will be auto-deleted.`);
+      
+      if (muted > 0) {
+        await reply(`🔇 Muted ${muted} member(s). Their messages will be auto-deleted.`);
+      } else {
+        await reply('Could not mute anyone (you cannot mute yourself).');
+      }
       break;
     }
 
-    case 'unmute': {
+
+        case 'unmute': {
       if (!jid.endsWith('@g.us')) {
         await reply('.unmute only works inside a group.');
         break;
       }
-      let target = quoted?.participant;
-      if (!target && args[0]) {
+      let targets = [];
+      
+      // Check for mentioned JIDs (tagged users)
+      const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+      if (mentionedJids.length > 0) {
+        targets = mentionedJids;
+      }
+      // Fallback: check quoted message
+      else if (quoted?.participant) {
+        targets = [quoted.participant];
+      }
+      // Fallback: check number argument
+      else if (args[0]) {
         const num = args[0].replace(/\D/g, '');
-        if (num) target = num + '@s.whatsapp.net';
+        if (num) targets = [num + '@s.whatsapp.net'];
       }
-      if (!target) {
-        await reply('Reply to their message with .unmute, or .unmute <number>');
+      
+      if (targets.length === 0) {
+        await reply('Reply to their message, tag them with @, or use .unmute <number>');
         break;
       }
-      if (!isMuted(jid, target)) {
-        await reply(`${target.split('@')[0]} is not muted.`);
-        break;
+      
+      let unmuted = 0;
+      let notMuted = [];
+      
+      for (const target of targets) {
+        if (isMuted(jid, target)) {
+          setMuted(jid, target, false);
+          unmuted++;
+        } else {
+          notMuted.push(target.split('@')[0]);
+        }
       }
-      setMuted(jid, target, false);
-      await reply(`🔊 Unmuted ${target.split('@')[0]} in this group.`);
+      
+      let response = '';
+      if (unmuted > 0) response += `🔊 Unmuted ${unmuted} member(s).\n`;
+      if (notMuted.length > 0) response += `${notMuted.join(', ')} were not muted.`;
+      
+      await reply(response || 'No changes made.');
       break;
     }
+
 
     case 'sticker': {
       const directType = findMediaType(msg.message);
