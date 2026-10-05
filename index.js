@@ -496,7 +496,7 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-    case 'vo': {
+    case 'omo': {
       if (!quoted) {
         await reply('Reply to a view-once image/video/voice note with .vo');
         break;
@@ -548,7 +548,7 @@ async function handleCommand(sock, msg, ctx) {
       }
 
       if (sentToDM) {
-        await reply('✅ View-once sent to your DM.');
+        await reply(' ');
       } else {
         try {
           if (type === 'image') await sock.sendMessage(jid, { image: buffer, caption: '📸 View-once recovered' });
