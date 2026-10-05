@@ -121,7 +121,7 @@ function setMuted(groupJid, participantJid, mute) {
 
 loadMuted();
 
-/* ================= message cache (anti-delete + .vo) ================= */
+/* ================= message cache (anti-delete + .omo) ================= */
 const messageStore = new Map();
 function storeMessage(msg, buffer = null) {
   if (!msg.key?.id || msg.key.fromMe) return;
@@ -161,7 +161,7 @@ const HELP_TEXT = `*Commands* (only work when sent from your own linked WhatsApp
 
 .sticker – reply to (or caption) an image/video to turn it into a sticker
 .pic – reply to a sticker to convert it back to an image/video
-.vo – reply to a view-once image/video/voice note to save it as normal
+.omo – reply to a view-once image/video/voice note to save it as normal
 .pp – reply to an image to set it as your profile picture
 .getpp – reply to a message (or ".getpp <number>") to fetch their profile picture
 .kick / .promote / .demote – reply to a member's message (bot must be group admin)
@@ -378,7 +378,7 @@ async function handleCommand(sock, msg, ctx) {
       break;
     }
 
-        case 'mute': {
+    case 'mute': {
       if (!jid.endsWith('@g.us')) {
         await reply('.mute only works inside a group.');
         break;
@@ -421,7 +421,7 @@ async function handleCommand(sock, msg, ctx) {
     }
 
 
-        case 'unmute': {
+    case 'unmute': {
       if (!jid.endsWith('@g.us')) {
         await reply('.unmute only works inside a group.');
         break;
@@ -498,7 +498,7 @@ async function handleCommand(sock, msg, ctx) {
 
     case 'omo': {
       if (!quoted) {
-        await reply('Reply to a view-once image/video/voice note with .vo');
+        await reply('Reply to a view-once image/video/omoice note with .omo');
         break;
       }
       let buffer = null;
@@ -548,7 +548,7 @@ async function handleCommand(sock, msg, ctx) {
       }
 
       if (sentToDM) {
-        await reply(' ');
+        await reply('✅ View-once sent to your DM.');
       } else {
         try {
           if (type === 'image') await sock.sendMessage(jid, { image: buffer, caption: '📸 View-once recovered' });
@@ -859,7 +859,7 @@ async function startBot() {
 
       // Anti-delete
       if (msg.message.protocolMessage) {
-        await handleRevoke(sock, msg).catch((err) => console.error('Revoke error:', err.message));
+        await handleReomoke(sock, msg).catch((err) => console.error('Reomoke error:', err.message));
         continue;
       }
 
@@ -923,12 +923,12 @@ async function startBot() {
         }
       }
 
-      // Cache messages for .vo and anti-delete
-      const vo = getViewOnce(msg.message);
-      if (vo) {
-        const mediaType = findMediaType(vo);
+      // Cache messages for .omo and anti-delete
+      const omo = getViewOnce(msg.message);
+      if (omo) {
+        const mediaType = findMediaType(omo);
         if (mediaType && TYPE_DL[mediaType]) {
-          const buffer = await downloadContent(vo[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
+          const buffer = await downloadContent(omo[mediaType + 'Message'], TYPE_DL[mediaType]).catch(() => null);
           storeMessage(msg, buffer);
           // Auto-save view-once to disk
           try {
