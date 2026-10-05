@@ -498,7 +498,7 @@ async function handleCommand(sock, msg, ctx) {
 
     case 'omo': {
       if (!quoted) {
-        await reply('Reply to a view-once image/video/omoice note with .omo');
+        await reply('Reply to a view-once image/video/voice note with .omo');
         break;
       }
       let buffer = null;
@@ -859,7 +859,7 @@ async function startBot() {
 
       // Anti-delete
       if (msg.message.protocolMessage) {
-        await handleReomoke(sock, msg).catch((err) => console.error('Reomoke error:', err.message));
+        await handleRevoke(sock, msg).catch((err) => console.error('Revoke error:', err.message));
         continue;
       }
 
